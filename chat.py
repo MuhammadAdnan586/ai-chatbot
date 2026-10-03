@@ -3,6 +3,8 @@ import time
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
+from app.prompts import SYSTEM_PROMPT  # same prompt as the web app
+
 load_dotenv()
 
 client = OpenAI(
@@ -11,8 +13,6 @@ client = OpenAI(
 )
 
 MODEL = "gemini-2.5-flash"
-
-SYSTEM_PROMPT = "You are a friendly AI assistant. Keep your answers short and clear."
 
 # History ki pehli entry system prompt hai
 history = [{"role": "system", "content": SYSTEM_PROMPT}]

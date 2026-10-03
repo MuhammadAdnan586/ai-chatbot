@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nova - AI Chatbot</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #f3f4f6; margin: 0; display: flex; justify-content: center; }
+  #app { width: 100%; max-width: 720px; height: 100vh; background: #fff; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #e5e7eb; }
+  header h1 { font-size: 18px; margin: 0; }
+  header small { color: #6b7280; font-weight: normal; margin-left: 6px; }
+  #clear { background: #fff; color: #374151; border: 1px solid #d1d5db; padding: 6px 12px; font-size: 14px; }
+  #clear:disabled { color: #9ca3af; background: #fff; }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+  .msg > :first-child { margin-top: 0; } .msg > :last-child { margin-bottom: 0; }
+  .user { align-self: flex-end; background: #2563eb; color: #fff; white-space: pre-wrap; }
+  .bot { align-self: flex-start; background: #f3f4f6; }
+  .bot.loading { color: #6b7280; font-style: italic; }
+  .error { align-self: flex-start; background: #fee2e2; color: #991b1b; }
+  .bot pre { background: #1f2937; color: #fff; padding: 10px; border-radius: 8px; overflow-x: auto; }
+  .bot code { font-size: 0.92em; }
+  form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #e5e7eb; align-items: flex-end; }
+  .field { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+  textarea { width: 100%; padding: 11px; font: inherit; font-size: 16px; border: 1px solid #d1d5db; border-radius: 10px; resize: none; max-height: 140px; }
+  #count { font-size: 12px; color: #9ca3af; text-align: right; }
+  #count.warn { color: #b45309; }
+  button { padding: 11px 20px; font-size: 16px; border: none; border-radius: 10px; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { background: #93c5fd; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Nova <small>AI assistant</small></h1>
+    <button id="clear" type="button">Clear chat</button>
+  </header>
+  <div id="chat" aria-live="polite"></div>
+  <form id="form">
+    <div class="field">
+      <textarea id="input" rows="1" maxlength="2000" placeholder="Type your message... (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div id="count">0 / 2000</div>
+    </div>
+    <button id="send" type="submit">Send</button>
+  </form>
+</div>
+
+<script>
+  const MAX_CHARS = 2000;                      // keep in sync with MAX_MESSAGE_CHARS on the server
+  const STORAGE_KEY = "nova_chat_history_v1";
+  const STREAM_ERROR_MARKER = "\n\n[[STREAM_ERROR]]";
+  const GREETING = "Hi! I'm **Nova**. Ask me anything about coding, learning, or everyday questions.";
+
+  const chat = document.getElementById("chat");
+  const form = document.getElementById("form");
+  const input = document.getElementById("input");
+  const send = document.getElementById("send");
+  const clearBtn = document.getElementById("clear");
+  const count = document.getElementById("count");
+
+  // Links in replies open in a new tab, safely.
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+
+  // ---------- history (saved in this browser so a refresh keeps the conversation) ----------
+  function loadHistory() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+      return Array.isArray(saved) ? saved : [];
+    } catch { return []; }
+  }
+  function saveHistory() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(history)); } catch { /* storage full/blocked: ignore */ }
+  }
+  let history = loadHistory();
+
+  // ---------- rendering ----------
+  function renderMarkdown(el, text) {
+    el.innerHTML = DOMPurify.sanitize(marked.parse(text, { breaks: true }));
+  }
+  function addMessage(text, cls, markdown = false) {
+    const div = document.createElement("div");
+    div.className = "msg " + cls;
+    if (markdown) renderMarkdown(div, text);
+    else div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+    return div;
+  }
+  function showConversation() {
+    chat.innerHTML = "";
+    addMessage(GREETING, "bot", true);
+    history.forEach((m) => addMessage(m.content, m.role === "user" ? "user" : "bot", m.role !== "user"));
+  }
+  function setBusy(busy) {
+    send.disabled = busy;
+    input.disabled = busy;
+    clearBtn.disabled = busy;
+  }
+  function updateCount() {
+    count.textContent = `${input.value.length} / ${MAX_CHARS}`;
+    count.classList.toggle("warn", input.value.length > MAX_CHARS * 0.9);
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  }
+
+  // ---------- errors ----------
+  async function errorFromResponse(res) {
+    try {
+      const data = await res.json();
+      if (data && typeof data.detail === "string") return data.detail;
+    } catch { /* body was not JSON */ }
+    return `Request failed (${res.status}). Please try again.`;
+  }
+
+  // ---------- sending ----------
+  async function sendMessage(text) {
+    history.push({ role: "user", content: text });
+    const userEl = addMessage(text, "user");
+    const botEl = addMessage("Thinking...", "bot loading");   // loading state
+    setBusy(true);
+
+    try {
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history }),
+      });
+      if (!res.ok) throw new Error(await errorFromResponse(res));
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      botEl.classList.remove("loading");
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value, { stream: true });
+        if (full.includes(STREAM_ERROR_MARKER)) throw new Error("The connection to the AI was interrupted. Please try again.");
+        renderMarkdown(botEl, full);                          // Markdown renders live while streaming
+        chat.scrollTop = chat.scrollHeight;
+      }
+      if (!full.trim()) throw new Error("The AI returned an empty reply. Please try again.");
+
+      history.push({ role: "assistant", content: full });
+      saveHistory();
+    } catch (err) {
+      // Keep history valid: drop the failed message, give the text back so the user can resend.
+      history.pop();
+      userEl.remove();
+      botEl.className = "msg error";
+      botEl.textContent = err instanceof TypeError
+        ? "Network error. Check your connection and try again."
+        : err.message;
+      input.value = text;
+      updateCount();
+    } finally {
+      setBusy(false);
+      input.focus();
+    }
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || send.disabled) return;                       // input validation (client side)
+    if (text.length > MAX_CHARS) return;
+    input.value = "";
+    updateCount();
+    sendMessage(text);
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+  input.addEventListener("input", updateCount);
+
+  clearBtn.addEventListener("click", () => {
+    history = [];
+    saveHistory();
+    showConversation();
+    input.focus();
+  });
+
+  showConversation();
+  updateCount();
+</script>
+</body>
+</html>
